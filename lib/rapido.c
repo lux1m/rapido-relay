@@ -1,5 +1,6 @@
 #include "rapido.h"
 #include "rapido_internals.h"
+#include "../t/util.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
@@ -644,8 +645,8 @@ static const rapido_frame_type_t new_session_id_frame_type = 0x4;
 static const rapido_frame_type_t new_address_frame_type = 0x5;
 static const rapido_frame_type_t connection_reset_frame_type = 0x6;
 static __attribute__((unused)) const rapido_frame_type_t ebpf_code_frame_type = 0x7;
-static const rapido_frame_type_t tunnel_control_frame_type = 0x8;
-static const rapido_frame_type_t tunnel_data_frame_type = 0x9;
+static const rapido_frame_type_t tunnel_control_frame_type = 0x10;
+static const rapido_frame_type_t tunnel_data_frame_type = 0x11;
 
 typedef struct {
     rapido_stream_id_t stream_id;
@@ -682,16 +683,6 @@ typedef struct {
     size_t offset;
     rapido_connection_id_t connection_id;
 } rapido_ebpf_code_frame_t;
-
-typedef struct {
-    rapido_tunnel_id_t tunnel_id;
-    union {
-        uint8_t family;
-        uint8_t flags;
-    };
-    uint8_t addr[16];
-    uint16_t port;
-} rapido_tunnel_control_frame_t;
 
 typedef struct {
     rapido_tunnel_id_t tunnel_id;
@@ -1010,48 +1001,156 @@ int rapido_close_session(rapido_session_t *session, rapido_connection_id_t conne
     return 0;
 }
 
-void rapido_tunnel_init(rapido_session_t *session, rapido_tunnel_t *tunnel) {
-    memset(tunnel, 0, sizeof(rapido_tunnel_t));
-    rapido_buffer_init(&tunnel->read_buffer, 2 * TLS_MAX_RECORD_SIZE);
-    rapido_buffer_init(&tunnel->send_buffer, 2 * TLS_MAX_RECORD_SIZE);
+void rapido_tunnel_set_state(rapido_session_t *session, rapido_tunnel_t *tunnel, uint8_t state, const char *funcname) {
+    char *state_name;
+    rapido_application_notification_t *notification = NULL;
 
-    if (!session->is_server) {
-        // If tunnel is being created on the client, open IPC Unix sockets
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, tunnel->ipc_sockets) == 0);
+    switch (state) {
+        case TUNNEL_STATE_NEW:
+            state_name = "NEW";
+            break;
+        case TUNNEL_STATE_READY:
+            state_name = "READY";
+            notification = rapido_queue_push(&session->pending_notifications);
+            notification->notification_type = rapido_tunnel_ready;
+            notification->tunnel_id = tunnel->tunnel_id;
+            break;
+        case TUNNEL_STATE_CONNECTING:
+            state_name = "CONNECTING";
+            break;
+        case TUNNEL_STATE_CLOSING:
+            state_name = "CLOSING";
+            break;
+        case TUNNEL_STATE_CLOSED:
+            state_name = "CLOSED";
+            notification = rapido_queue_push(&session->pending_notifications);
+            notification->notification_type = rapido_tunnel_closed;
+            notification->tunnel_id = tunnel->tunnel_id;
+            break;
+        case TUNNEL_STATE_FAILED:
+            state_name = "FAILED";
+            notification = rapido_queue_push(&session->pending_notifications);
+            notification->notification_type = rapido_tunnel_failed;
+            notification->tunnel_id = tunnel->tunnel_id;
+            break;
+        default:
+            state_name = "UNKNOWN STATE";
+            break;
     }
+
+    tunnel->state = state;
+    if (tunnel->nexthop_session) {
+        rapido_tunnel_t *nested_tun = rapido_array_get(&tunnel->nexthop_session->tunnels, tunnel->tunnel_id);
+        nested_tun->state = state;
+    }
+
+    QLOG(session, "api", funcname, "", "{\"tunnel_id\": \"%u\", \"state\": \"%s\"}",
+        tunnel->tunnel_id, state_name);
+}
+
+void *rapido_read_from_tunnel(rapido_session_t *session, rapido_tunnel_id_t tunnel_id, size_t *len) {
+    rapido_tunnel_t *tunnel = rapido_array_get(&session->tunnels, tunnel_id);
+    assert(tunnel != NULL);
+    assert(tunnel->state == TUNNEL_STATE_READY);
+    void *data = rapido_buffer_pop(tunnel->read_buffer, len);
+    QLOG(session, "api", "rapido_read_from_tunnel", "", "{\"tunnel_id\": \"%d\", \"len\": \"%lu\"}", tunnel_id, *len);
+    return data;
+}
+
+int rapido_write_to_tunnel(rapido_session_t *session, rapido_tunnel_id_t tunnel_id, const void *data, size_t len) {
+    rapido_tunnel_t *tunnel = rapido_array_get(&session->tunnels, tunnel_id);
+    assert(tunnel != NULL);
+    assert(tunnel->state == TUNNEL_STATE_READY);
+    QLOG(session, "api", "rapido_write_to_tunnel", "", "{\"tunnel_id\": \"%d\", \"len\": \"%lu\"}", tunnel_id, len);
+    rapido_buffer_push(tunnel->send_buffer, data, len);
+    return 0;
+}
+
+
+void rapido_tunnel_init(rapido_session_t *session, rapido_tunnel_t *tunnel, const char *nexthop_host, struct sockaddr_storage *nexthop_address, socklen_t nexthop_salen) {
+    memset(tunnel, 0, sizeof(rapido_tunnel_t));
+    rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_NEW, "rapido_tunnel_init");
+
+    // If there is a nexthop, open nested session and tunnel, and "connect" the rx/tx buffers.
+    if (nexthop_address) {
+        assert(nexthop_host != NULL && nexthop_address != NULL && nexthop_salen > 0);
+        memcpy(&tunnel->nexthop_addr, nexthop_address, sizeof(struct sockaddr_storage));
+        strncpy(&tunnel->nexthop_host[0], nexthop_host, 254);
+        tunnel->nexthop_session = rapido_new_session(session->tls_ctx, false, tunnel->nexthop_host, session->qlog.out);
+
+        rapido_address_id_t remote_addr = rapido_add_remote_address(tunnel->nexthop_session, (struct sockaddr *)nexthop_address, nexthop_salen);
+        rapido_create_connection(tunnel->nexthop_session, 0, remote_addr);
+
+        rapido_tunnel_t *nested_tun = rapido_array_add(&tunnel->nexthop_session->tunnels, tunnel->tunnel_id);
+        rapido_tunnel_init(tunnel->nexthop_session, nested_tun, NULL, NULL, 0);
+        nested_tun->tunnel_id = tunnel->tunnel_id;
+
+        tunnel->role = nested_tun->role = rapido_tunnel_relay;
+        tunnel->is_parent = true;
+        nested_tun->is_parent = false;
+        tunnel->read_buffer = nested_tun->send_buffer;
+        tunnel->send_buffer = nested_tun->read_buffer;
+
+        nested_tun->nexthop_session = session;  // Provide pointer back to the parent session.
+    } else {
+        tunnel->role = (session->is_server) ? rapido_tunnel_destination : rapido_tunnel_source;
+        tunnel->is_parent = true;
+        tunnel->read_buffer = malloc(sizeof(rapido_buffer_t));
+        tunnel->send_buffer = malloc(sizeof(rapido_buffer_t));
+        rapido_buffer_init(tunnel->read_buffer, 2 * TLS_MAX_RECORD_SIZE);
+        rapido_buffer_init(tunnel->send_buffer, 2 * TLS_MAX_RECORD_SIZE);
+    }
+
+    QLOG(session, "api", "rapido_tunnel_init", "", "{\"tunnel_id\": \"%d\", \"role\": \"%d\"}", tunnel->tunnel_id, tunnel->role);
+    return tunnel->tunnel_id;
 }
 
 rapido_tunnel_id_t rapido_open_tunnel(rapido_session_t *session) {
     rapido_tunnel_t *tunnel = rapido_array_add(&session->tunnels, session->next_tunnel_id);
+    rapido_tunnel_init(session, tunnel, NULL, NULL, 0);
     tunnel->tunnel_id = session->next_tunnel_id++;
-    tunnel->state = TUNNEL_STATE_NEW;
-    rapido_tunnel_init(session, tunnel);
 
     QLOG(session, "api", "rapido_open_tunnel", "", "{\"tunnel_id\": \"%d\"}", tunnel->tunnel_id);
     return tunnel->tunnel_id;
 }
 
-int rapido_close_tunnel(rapido_session_t *session, rapido_tunnel_id_t tunnel_id) {
+void rapido_extend_tunnel(rapido_session_t *session, rapido_tunnel_id_t tunnel_id, const char* hostname, const char* port) {
     rapido_tunnel_t *tunnel = rapido_array_get(&session->tunnels, tunnel_id);
-    tunnel->state = TUNNEL_STATE_CLOSED;
-    
-    if (session->is_server) {
-        close(tunnel->destination_sockfd);
-    } else {
-        close(tunnel->ipc_sockets[0]);
-        close(tunnel->ipc_sockets[1]);
+    assert(tunnel->state == TUNNEL_STATE_READY && tunnel->role == rapido_tunnel_source);
+    rapido_tunnel_control_frame_t frame = { 0 };
+
+    struct sockaddr_storage sa;
+    socklen_t salen;
+
+    if (resolve_address((struct sockaddr *)&sa, &salen, hostname, port, AF_INET, SOCK_STREAM, IPPROTO_TCP) != 0) {
+        if (resolve_address((struct sockaddr *)&sa, &salen, hostname, port, AF_INET6, SOCK_STREAM, IPPROTO_TCP) != 0) {
+            fprintf(stderr, "Error: Unable to resolve nexthop address %s:%s to IPv4 or IPv6.", hostname, port);
+            exit(-1);
+        }
     }
 
-    QLOG(session, "api", "rapido_process_tunnel_control_frame", "", "{\"tunnel_id\": \"%u\", \"state\": \"CLOSED\"}",
-        tunnel->tunnel_id);
+    frame.family = (sa.ss_family == AF_INET) ? 4 : 6;
+    strncpy(frame.hostname, hostname, 255);
+    frame.port = htons((uint16_t)atoi(port));
+    frame.tunnel_id = tunnel_id;
+
+    tunnel->announce_frame = frame;
+    QLOG(session, "api", "rapido_extend_tunnel", "", "{\"tunnel_id\": \"%d\", \"next_hop\": \"%s:%s\"}", tunnel->tunnel_id, hostname, port);
 };
 
-int rapido_get_tunnel_fd(rapido_session_t *session, rapido_tunnel_id_t tunnel_id) {
-    // Error-checking function to get the user-facing socket for a tunnel
+void rapido_close_tunnel(rapido_session_t *session, rapido_tunnel_id_t tunnel_id) {
     rapido_tunnel_t *tunnel = rapido_array_get(&session->tunnels, tunnel_id);
-    assert(tunnel->state == TUNNEL_STATE_READY);
-    return tunnel->ipc_sockets[1];
-}
+    rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_CLOSING, "rapido_close_tunnel");
+    
+    if (tunnel->nexthop_session) {
+        // Propagate the tunnel closure to the next hop
+        rapido_close_tunnel(tunnel->nexthop_session, tunnel_id);
+    }
+    
+    QLOG(session, "api", "rapido_process_tunnel_control_frame", "", "{\"tunnel_id\": \"%u\", \"state\": \"CLOSED\"}",
+        tunnel->tunnel_id);
+    //TO DO
+};
 
 void rapido_stream_init(rapido_session_t *session, rapido_stream_t *stream) {
     memset(stream, 0, sizeof(rapido_stream_t));
@@ -1382,20 +1481,27 @@ int rapido_prepare_tunnel_control_frame(rapido_session_t *session, rapido_queued
         if (tun_frame->flags == TUNNEL_FLAG_READY) {
             ((rapido_tunnel_t*) rapido_array_get(&session->tunnels, tun_frame->tunnel_id))->state = TUNNEL_STATE_READY;
         }
+        if (tun_frame->flags == TUNNEL_FLAG_DESTINATION) {
+            ((rapido_tunnel_t*) rapido_array_get(&session->tunnels, tun_frame->tunnel_id))->state = TUNNEL_STATE_CONNECTING;
+        }
+        LOG {
+            QLOG(session, "frames", "rapido_prepare_tunnel_control_frame", "",
+                    "{\"tunnel_id\": \"%d\", \"flags\": \"%d\"}", tun_frame->tunnel_id, tun_frame->flags);
+        };
     } else {
-        size_t addr_len = tun_frame->family == 4 ? 4 : 16;
+        size_t addr_len = tun_frame->family == TUNNEL_FAMILY_IPV4 ? 4 : 16;
 
         buf[consumed++] = tun_frame->family;
+        strncpy(buf + consumed, tun_frame->hostname, sizeof(char[255]));
+        consumed += strlen(tun_frame->hostname) + 1;
         memcpy(buf + consumed, tun_frame->addr, addr_len);
         consumed += addr_len;
         *(uint16_t *)(buf + consumed) = tun_frame->port;
         consumed += sizeof(uint16_t);
 
         LOG {
-            char ip_string[46];
-            inet_ntop(tun_frame->family == 4 ? AF_INET : AF_INET6, tun_frame->addr, ip_string, 46);
             QLOG(session, "frames", "rapido_prepare_tunnel_control_frame", "",
-                    "{\"tunnel_id\": \"%d\", \"family\": \"%d\", \"address\": \"%s\", \"port\": \"%d\"}", tun_frame->tunnel_id, tun_frame->family, ip_string,
+                    "{\"tunnel_id\": \"%d\", \"family\": \"%d\", \"hostname\": \"%s\", \"port\": \"%d\"}", tun_frame->tunnel_id, tun_frame->family, tun_frame->hostname,
                     ntohs(tun_frame->port));
         };
 
@@ -1409,7 +1515,7 @@ int rapido_prepare_tunnel_control_frame(rapido_session_t *session, rapido_queued
 
 int rapido_decode_tunnel_control_frame(rapido_session_t *session, uint8_t *buf, size_t *len, rapido_tunnel_control_frame_t *frame) {
     // Check if size is enough for type(1) + tunnel_id(1) + family(1) + addr(4 or 16) + port(2)
-    assert(*len == 3 || *len == 9 || *len == 21);
+    assert(*len == 3 || (*len >= 6 && *len <= 276));
     size_t consumed = 1;
     frame->tunnel_id = *(uint8_t *)(buf + consumed++);
 
@@ -1422,7 +1528,9 @@ int rapido_decode_tunnel_control_frame(rapido_session_t *session, uint8_t *buf, 
         }
     } else {
         frame->family = *(uint8_t *)(buf + consumed++);
-        size_t addr_len = frame->family == 4 ? 4 : 16;
+        size_t addr_len = frame->family == TUNNEL_FAMILY_IPV4 ? 4 : 16;
+        strncpy((char *)&frame->hostname[0], (char *)(buf + consumed), sizeof(char[255]));
+        consumed += strlen(frame->hostname) + 1;
         memcpy(&frame->addr, (buf + consumed), addr_len);
         consumed += addr_len;
         frame->port = *((uint16_t *)(buf + consumed));
@@ -1430,9 +1538,9 @@ int rapido_decode_tunnel_control_frame(rapido_session_t *session, uint8_t *buf, 
 
         LOG {
             char ip_string[46];
-            inet_ntop(frame->family == 4 ? AF_INET : AF_INET6, frame->addr, ip_string, 46);
-            QLOG(session, "frames", "rapido_decode_tunnel_control_frame", "", "{\"tunnel_id\": \"%d\", \"family\": \"%d\", \"address\": \"%s\", \"port\": \"%d\"}",
-                frame->tunnel_id, frame->family, ip_string, ntohs(frame->port));
+            inet_ntop(frame->family == TUNNEL_FAMILY_IPV4 ? AF_INET : AF_INET6, frame->addr, ip_string, 46);
+            QLOG(session, "frames", "rapido_decode_tunnel_control_frame", "", "{\"tunnel_id\": \"%d\", \"family\": \"%d\", \"address\": \"%s\", \"hostname\": \"%s\", \"port\": \"%d\"}",
+                frame->tunnel_id, frame->family, ip_string, frame->hostname, ntohs(frame->port));
         }
     }
     return 0;
@@ -1440,83 +1548,124 @@ int rapido_decode_tunnel_control_frame(rapido_session_t *session, uint8_t *buf, 
 
 int rapido_process_tunnel_control_frame(rapido_session_t *session, rapido_tunnel_control_frame_t *frame) {
     rapido_tunnel_t *tunnel = rapido_array_get(&session->tunnels, frame->tunnel_id);
-    if (session->is_server) {
-        assert(frame->family == 4 || frame->family == 6 || frame->flags > 15);
-        if (!tunnel) {  // Check tunnel_id does not already exist
-            tunnel = (rapido_tunnel_t*) rapido_array_add(&session->tunnels, frame->tunnel_id);
-            rapido_tunnel_init(session, tunnel);
+    assert(frame->family == 4 || frame->family == 6 || frame->flags > 15);
+    if (!tunnel) {  // Check tunnel_id does not already exist
+        tunnel = (rapido_tunnel_t*) rapido_array_add(&session->tunnels, frame->tunnel_id);
+        if (frame->flags == TUNNEL_FLAG_DESTINATION) {
+            rapido_tunnel_init(session, tunnel, NULL, NULL, 0);
             tunnel->tunnel_id = frame->tunnel_id;
-            if (frame->family == 4) {  // IPv4
-                struct sockaddr_in addr;
-                addr.sin_port = frame->port;
-                memcpy(&addr.sin_addr, &frame->addr, sizeof(struct in_addr));
-                tunnel->destination_addr = *(struct sockaddr_storage *)&addr;
-                tunnel->destination_addr.ss_family = AF_INET;
-            } else {  // IPv6
-                struct sockaddr_in6 addr;
-                addr.sin6_port = frame->port;
-                memcpy(&addr.sin6_addr, &frame->addr, sizeof(struct in6_addr));
-                tunnel->destination_addr = *(struct sockaddr_storage *)&addr;
-                tunnel->destination_addr.ss_family = AF_INET6;
+            rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_READY, "rapido_process_tunnel_control_frame");
+            tunnel->announce_flag = TUNNEL_FLAG_READY;
+        } else {
+            // Request to complete tunnel with another hop
+            struct sockaddr_storage tunnel_endpoint;
+            socklen_t tunnel_endpoint_len;
+
+            if (frame->family == TUNNEL_FAMILY_IPV4) {
+                tunnel_endpoint_len = sizeof(struct sockaddr_in);
+                memcpy(&((struct sockaddr_in *)&tunnel_endpoint)->sin_addr, &frame->addr[0], 4);
+
+            } else {
+                tunnel_endpoint_len = sizeof(struct sockaddr_in6);
+                memcpy(&((struct sockaddr_in6 *)&tunnel_endpoint)->sin6_addr, &frame->addr[0], 16);
             }
-            tunnel->state = TUNNEL_STATE_NEW;
-            QLOG(session, "api", "rapido_process_tunnel_control_frame", "", "{\"tunnel_id\": \"%d\", \"state\": \"NEW\"}",
-                tunnel->tunnel_id);
-        }
-        if (frame->flags > 15) {
-            rapido_application_notification_t *notification = rapido_queue_push(&session->pending_notifications);
-            switch (frame->flags)
-            {
-            case TUNNEL_FLAG_CLOSED:
-                tunnel->state = TUNNEL_STATE_CLOSED;
-                close(tunnel->destination_sockfd);
-                QLOG(session, "api", "rapido_process_tunnel_control_frame", "", "{\"tunnel_id\": \"%u\", \"state\": \"CLOSED\"}",
-                    tunnel->tunnel_id);
-                break;
-            case TUNNEL_FLAG_FAILED:
-                tunnel->state = TUNNEL_STATE_FAILED;
-                close(tunnel->destination_sockfd);
-                QLOG(session, "api", "rapido_process_tunnel_control_frame", "", "{\"tunnel_id\": \"%u\", \"state\": \"FAILED\"}",
-                    tunnel->tunnel_id);
-                break;
-            default:
-                fprintf(stderr, "Error: Unknown tunnel control flags received by the server.");
-                return -1;
-            }
+
+            rapido_tunnel_init(session, tunnel, frame->hostname, &tunnel_endpoint, tunnel_endpoint_len);
+            tunnel->tunnel_id = frame->tunnel_id;
+            rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_CONNECTING, "rapido_process_tunnel_control_frame");
+            tunnel->announce_flag = TUNNEL_FLAG_CONNECTING;
         }
     } else {
-        // Client-side processing
-        rapido_application_notification_t *notification = rapido_queue_push(&session->pending_notifications);
-        switch (frame->flags)
-        {
-        case TUNNEL_FLAG_READY:
-            tunnel->state = TUNNEL_STATE_READY;
-            notification->notification_type = rapido_tunnel_ready;
-            notification->tunnel_id = tunnel->tunnel_id;
-            QLOG(session, "api", "rapido_process_tunnel_control_frame", "", "{\"tunnel_id\": \"%u\", \"state\": \"READY\"}",
-                tunnel->tunnel_id);
-            break;
-        case TUNNEL_FLAG_CLOSED:
-            if (tunnel) {
-                tunnel->state = TUNNEL_STATE_CLOSED;
+        // Tunnel already exists.
+        rapido_tunnel_t *nexthop_tun = NULL;
+        if (tunnel->nexthop_session != NULL) {
+            nexthop_tun = rapido_array_get(&(tunnel->nexthop_session)->tunnels, tunnel->tunnel_id);
+        }
+
+        if (tunnel->role == rapido_tunnel_source) {
+            switch (frame->flags)
+            {
+            case TUNNEL_FLAG_READY:
+                rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_READY, "rapido_process_tunnel_control_frame");
+                break;
+            case TUNNEL_FLAG_CONNECTING:
+                rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_CONNECTING, "rapido_process_tunnel_control_frame");
+                break;
+            case TUNNEL_FLAG_CLOSED:
+                rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_CLOSED, "rapido_process_tunnel_control_frame");
+                rapido_close_tunnel(session, tunnel->tunnel_id);
+                break;
+            case TUNNEL_FLAG_FAILED:
+                rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_FAILED, "rapido_process_tunnel_control_frame");
+                rapido_close_tunnel(session, tunnel->tunnel_id);
+                break;
+            default:
+                fprintf(stderr, "Error: Invalid or unknown flag received for node with 'source' role.");
+                exit(-1);
             }
-            notification->notification_type = rapido_tunnel_closed;
-            notification->tunnel_id = tunnel->tunnel_id;
-            QLOG(session, "api", "rapido_process_tunnel_control_frame", "", "{\"tunnel_id\": \"%u\", \"state\": \"CLOSED\"}",
-                frame->tunnel_id);
-            break;
-        case TUNNEL_FLAG_FAILED:
-            if (tunnel) {
-                tunnel->state = TUNNEL_STATE_FAILED;
+        }
+
+        if (tunnel->role == rapido_tunnel_relay) {
+            switch (frame->flags)
+            {
+            case TUNNEL_FLAG_READY:
+                rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_READY, "rapido_process_tunnel_control_frame");
+                // Can only be received from upstream, propagate downstream.
+                nexthop_tun->announce_flag = TUNNEL_FLAG_READY;
+                break;
+            case TUNNEL_FLAG_CONNECTING:
+                rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_CONNECTING, "rapido_process_tunnel_control_frame");
+                // Can only be received from upstream, propagate downstream.
+                nexthop_tun->announce_flag = TUNNEL_FLAG_CONNECTING;
+                break;
+            case TUNNEL_FLAG_CLOSED:
+                rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_CLOSED, "rapido_process_tunnel_control_frame");
+                rapido_close_tunnel(session, tunnel->tunnel_id);
+                // Can be received from upstream or downstream, propagate in the same direction.
+                nexthop_tun->announce_flag = TUNNEL_FLAG_CLOSED;
+                break;
+            case TUNNEL_FLAG_FAILED:
+                rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_FAILED, "rapido_process_tunnel_control_frame");
+                rapido_close_tunnel(session, tunnel->tunnel_id);
+                // Can be received from upstream or downstream, propagate in the same direction.
+                nexthop_tun->announce_flag = TUNNEL_FLAG_FAILED;
+                break;
+            default:
+                // In other cases, forward the control frame in the same direction.
+                memcpy(&nexthop_tun->announce_frame, frame, sizeof(rapido_tunnel_control_frame_t));
+                break;
             }
-            notification->notification_type = rapido_tunnel_failed;
-            notification->tunnel_id = frame->tunnel_id;
-            QLOG(session, "api", "rapido_process_tunnel_control_frame", "", "{\"tunnel_id\": \"%u\", \"state\": \"FAILED\"}",
-                frame->tunnel_id);
-            break;
-        default:
-            fprintf(stderr, "Error: Unknown tunnel control flags received by the client.");
-            return -1;
+        }
+
+        if (tunnel->role == rapido_tunnel_destination) {
+            if (frame->flags > 15) {
+                switch (frame->flags)
+                {
+                case TUNNEL_FLAG_CLOSED:
+                    rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_CLOSED, "rapido_process_tunnel_control_frame");
+                    rapido_close_tunnel(session, tunnel->tunnel_id);
+                    break;
+                case TUNNEL_FLAG_FAILED:
+                    rapido_tunnel_set_state(session, tunnel, TUNNEL_FLAG_FAILED, "rapido_process_tunnel_control_frame");
+                    rapido_close_tunnel(session, tunnel->tunnel_id);
+                    break;
+                }
+            } else {
+                // Request to add a new hop at the end of the chain.
+                struct sockaddr_storage tunnel_endpoint;
+                socklen_t tunnel_endpoint_len;
+                char str_port[6];
+                snprintf(str_port, 6, "%u", ntohs(frame->port));
+                if (resolve_address((struct sockaddr *)&tunnel_endpoint, &tunnel_endpoint_len, frame->hostname, str_port, AF_INET, SOCK_STREAM, IPPROTO_TCP) != 0) {
+                    if (resolve_address((struct sockaddr *)&tunnel_endpoint, &tunnel_endpoint_len, frame->hostname, str_port, AF_INET6, SOCK_STREAM, IPPROTO_TCP) != 0) {
+                        fprintf(stderr, "Error: Could not resolve the tunnel endpoint.");
+                        exit(1);
+                    }
+                }
+
+                rapido_tunnel_init(session, tunnel, frame->hostname, &tunnel_endpoint, tunnel_endpoint_len);
+                tunnel->tunnel_id = frame->tunnel_id;
+            }
         }
     }
     return 0;
@@ -1533,7 +1682,7 @@ int rapido_prepare_tunnel_data_frame(rapido_session_t *session, rapido_tunnel_t 
 
     // Currently does not handle the max possible packet length (16-bit integer)
     size_t payload_len = min(*len, TLS_MAX_RECORD_SIZE) - tunnel_header_len;
-    void *tunnel_data = rapido_buffer_pop(&tunnel->send_buffer, &payload_len); // Sets payload_len to buffered data length
+    void *tunnel_data = rapido_buffer_pop(tunnel->send_buffer, &payload_len); // Sets payload_len to buffered data length
 
     *(rapido_frame_type_t *)(buf + consumed) = tunnel_data_frame_type;
     consumed += sizeof(rapido_frame_type_t);
@@ -1570,19 +1719,17 @@ int rapido_decode_tunnel_data_frame(rapido_session_t *session, uint8_t *buf, siz
 
 int rapido_process_tunnel_data_frame(rapido_session_t *session, rapido_tunnel_data_frame_t *frame) {
     rapido_tunnel_t *tunnel = rapido_array_get(&session->tunnels, frame->tunnel_id);
+    assert(tunnel);
     assert(tunnel->state == TUNNEL_STATE_READY);
     assert(frame->len > 0);
     
-    int written_bytes = 0;
-    if (session->is_server) {
-        // Server-side processing
-        written_bytes = write(tunnel->destination_sockfd, frame->data, frame->len);
-    } else {
-        // Client-side processing
-        written_bytes = write(tunnel->ipc_sockets[0], frame->data, frame->len);
-    }
+    rapido_buffer_push(tunnel->read_buffer, frame->data, frame->len);
 
-    assert(written_bytes == frame->len);
+    if (tunnel->role != rapido_tunnel_relay) {
+        rapido_application_notification_t *notification = rapido_queue_push(&session->pending_notifications);
+        notification->notification_type = rapido_tunnel_has_data;
+        notification->tunnel_id = frame->tunnel_id;
+    }
 
     QLOG(session, "frames", "process_tunnel_data_frame", "",
          "{\"tunnel_id\": \"%u\", \"len\": \"%u\"}", frame->tunnel_id, frame->len);
@@ -1772,70 +1919,66 @@ int rapido_connection_wants_to_send(rapido_session_t *session, rapido_connection
 
     if (!wants_to_send) {
         rapido_array_iter(&session->tunnels, i, rapido_tunnel_t *tunnel, {
-            // Set wants_to_send if there is a new tunnel waiting to be opened.
+            // Set wants_to_send if the tunnel has a flag or frame to announce
+            if (tunnel->announce_flag) {
+                rapido_tunnel_control_frame_t tun_frame;
+                tun_frame.tunnel_id = tunnel->tunnel_id;
+                tun_frame.flags = tunnel->announce_flag;
+
+                rapido_queued_frame_t queue_frame = { 0 };
+                queue_frame.type = tunnel_control_frame_type;
+                queue_frame.tun_ctrl_frame = tun_frame;
+
+                memcpy(rapido_queue_push(&connection->frame_queue), &queue_frame, sizeof(rapido_queued_frame_t));
+                tunnel->announce_flag = 0;
+
+                wants_to_send = true;
+                LOG {
+                    reason = "Tunnel has flag to announce.";
+                }
+            }
+
+            if (tunnel->announce_frame.flags != 0) {
+                rapido_queued_frame_t queue_frame = { 0 };
+                queue_frame.type = tunnel_control_frame_type;
+                queue_frame.tun_ctrl_frame = tunnel->announce_frame;
+
+                memcpy(rapido_queue_push(&connection->frame_queue), &queue_frame, sizeof(rapido_queued_frame_t));
+                memset(&tunnel->announce_frame, 0, sizeof(rapido_tunnel_control_frame_t));
+
+                wants_to_send = true;
+                LOG {
+                    reason = "Tunnel has frame to propagate.";
+                }
+            }
+
+            // Set wants_to_send if the tunnel has data to send
+            if (tunnel->state == TUNNEL_STATE_READY && tunnel->send_buffer->size > 0) {
+                wants_to_send |= (tunnel->send_buffer->size > 0);
+            }
+
+            // Set wants_to_send if a tunnel is ready to be opened
             if (tunnel->state == TUNNEL_STATE_NEW && !session->is_server) {
+                wants_to_send = true;
                 rapido_tunnel_control_frame_t tun_frame;
                 tun_frame.tunnel_id = tunnel->tunnel_id;
-
-                if (tunnel->destination_addr.ss_family == AF_INET) {
-                    tun_frame.family = 4;
-                    tun_frame.port = ((struct sockaddr_in *)&tunnel->destination_addr)->sin_port;
-                    memcpy(tun_frame.addr, (void *)&((struct sockaddr_in *)&tunnel->destination_addr)->sin_addr, 4);
+                if (tunnel->nexthop_session == NULL || !tunnel->is_parent) {
+                    tun_frame.flags = TUNNEL_FLAG_DESTINATION;
                 } else {
-                    tun_frame.family = 6;
-                    tun_frame.port = ((struct sockaddr_in6 *)&tunnel->destination_addr)->sin6_port;
-                    memcpy(tun_frame.addr, (void *)&((struct sockaddr_in6 *)&tunnel->destination_addr)->sin6_addr, 16);
+                    tun_frame.family = (tunnel->nexthop_addr.ss_family == AF_INET) ? 4 : 6;
+                    strncpy(tun_frame.hostname, tunnel->nexthop_host, 254);
+                    if (tunnel->nexthop_addr.ss_family == AF_INET) {
+                        tun_frame.port = ((struct sockaddr_in*)&tunnel->nexthop_addr)->sin_port;
+                    } else {
+                        tun_frame.port = ((struct sockaddr_in6*)&tunnel->nexthop_addr)->sin6_port;
+                    }
                 }
-
                 rapido_queued_frame_t queue_frame = { 0 };
                 queue_frame.type = tunnel_control_frame_type;
                 queue_frame.tun_ctrl_frame = tun_frame;
-
                 memcpy(rapido_queue_push(&connection->frame_queue), &queue_frame, sizeof(rapido_queued_frame_t));
 
-                wants_to_send = true;
-                LOG {
-                    reason = "New tunnel to open";
-                }
-            }
-            // Set wants_to_send if there is a tunnel that is open but not advertised
-            if (tunnel->state == TUNNEL_STATE_CONNECTED && session->is_server) {
-                rapido_tunnel_control_frame_t tun_frame;
-                tun_frame.tunnel_id = tunnel->tunnel_id;
-                tun_frame.flags = TUNNEL_FLAG_READY;
-                
-                rapido_queued_frame_t queue_frame = { 0 };
-                queue_frame.type = tunnel_control_frame_type;
-                queue_frame.tun_ctrl_frame = tun_frame;
-
-                memcpy(rapido_queue_push(&connection->frame_queue), &queue_frame, sizeof(rapido_queued_frame_t));
-
-                wants_to_send = true;
-                LOG {
-                    reason = "Tunnel is now connected";
-                }
-            }
-            // Set wants_to_send if the client IPC socket or the server destination socket have data
-            if (tunnel->state == TUNNEL_STATE_READY && tunnel->send_buffer.size) {
-                wants_to_send |= (tunnel->send_buffer.size > 0);
-            }
-            // Set wants_to_send if a tunnel is in a closed or failed state
-            if (tunnel->state == TUNNEL_STATE_CLOSED || tunnel->state == TUNNEL_STATE_FAILED) {
-                rapido_tunnel_control_frame_t tun_frame;
-                tun_frame.tunnel_id = tunnel->tunnel_id;
-                tun_frame.flags = (tunnel->state == TUNNEL_STATE_CLOSED) ? TUNNEL_FLAG_CLOSED : TUNNEL_FLAG_FAILED;
-
-                rapido_queued_frame_t queue_frame = { 0 };
-                queue_frame.type = tunnel_control_frame_type;
-                queue_frame.tun_ctrl_frame = tun_frame;
-
-                memcpy(rapido_queue_push(&connection->frame_queue), &queue_frame, sizeof(rapido_queued_frame_t));
-                rapido_array_delete(&session->tunnels, tunnel->tunnel_id);
-
-                wants_to_send = true;
-                LOG {
-                    reason = "Tunnel is closing or has failed and needs to notify remote";
-                }
+                rapido_tunnel_set_state(session, tunnel, TUNNEL_STATE_CONNECTING, "rapido_connection_wants_to_send");
             }
         });
     };
@@ -2006,7 +2149,7 @@ int rapido_prepare_record(rapido_session_t *session, rapido_connection_t *connec
     rapido_array_iter(&session->tunnels, i, rapido_tunnel_t *tunnel, {
         if (consumed >= *len)
             break;
-        if (tunnel->send_buffer.size) {
+        if (tunnel->send_buffer->size) {
             size_t frame_len = *len - consumed;
             assert(rapido_prepare_tunnel_data_frame(session, tunnel, cleartext + consumed, &frame_len) == 0);
             consumed += frame_len;
@@ -2567,80 +2710,8 @@ int rapido_run_network(rapido_session_t *session, int timeout) {
                 fd_types[nfds] = fd_pending_connection;
                 nfds++;
             });
-           rapido_array_iter(&session->tunnels, i, rapido_tunnel_t *tunnel, {
-                // Server-side tunneling code
-                if (tunnel->state == TUNNEL_STATE_NEW) {  // Open connection to the destination
-                    int domain = tunnel->destination_addr.ss_family;
-                    tunnel->destination_sockfd = socket(domain, SOCK_STREAM, 0);
-                    fprintf(stderr, "Destination socket FD is %d\n", tunnel->destination_sockfd);
-                    if (connect(
-                            tunnel->destination_sockfd,
-                            (struct sockaddr *)&tunnel->destination_addr,
-                            tunnel->destination_addr.ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6)
-                        ) == 0) {
-                            // Once socket is connected, mark tunnel as connected.
-                            tunnel->state = TUNNEL_STATE_CONNECTED;
-                            QLOG(session, "api", "rapido_run_network", "", "{\"tunnel_id\": \"%d\", \"state\": \"READY\"}",
-                                tunnel->tunnel_id);
-                        } else {
-                            // On failure, mark tunnel as failed, and log the last error.
-                            fprintf(stderr, "SS_FAMILY = %d\n", tunnel->destination_addr.ss_family);
-                            tunnel->state = TUNNEL_STATE_FAILED;
-                            QLOG(session, "error", "rapido_run_network", "", "{\"tunnel_id\": \"%d\", \"error\": \"%s\"}",
-                                tunnel->tunnel_id, strerror(errno));
-                            QLOG(session, "api", "rapido_run_network", "", "{\"tunnel_id\": \"%d\", \"state\": \"FAILED\"}",
-                                tunnel->tunnel_id);
-                        }
-                }
-
-                if (tunnel->state == TUNNEL_STATE_READY) {
-                    struct pollfd pfd;
-                    pfd.fd = tunnel->destination_sockfd;
-                    pfd.events = POLLIN;
-                    if (poll(&pfd, 1, timeout) > 0) {
-                        fprintf(stderr, "Destination socket is ready to be read!\n");
-                        size_t recvbuf_max = TLS_MAX_ENCRYPTED_RECORD_SIZE;
-                        uint8_t *recvbuf = rapido_buffer_alloc(&tunnel->read_buffer, &recvbuf_max, 1500);
-                        ssize_t data_len = recv(tunnel->destination_sockfd, recvbuf, recvbuf_max, 0);
-                        if (data_len <= 0) {
-                            // On failure or graceful termination, close tunnel and mark as failed if necessary.
-                            rapido_close_tunnel(session, tunnel->tunnel_id);
-                            if (data_len < 0) {
-                                tunnel->state = TUNNEL_STATE_FAILED;
-                            }
-                        } else {
-                            // On success, copy read buffer to the send queue for the tunnel
-                            rapido_buffer_push(&tunnel->send_buffer, recvbuf, data_len);
-                            fprintf(stderr, "Added %ld bytes to the tunnel TX buffer.\n", data_len);
-                        }
-                    }
-                }
-            });
-        } else {
-            // Client-side tunneling code
-            rapido_array_iter(&session->tunnels, i, rapido_tunnel_t *tunnel, {
-                if (tunnel->state == TUNNEL_STATE_READY) {
-                    struct pollfd pfd;
-                    pfd.fd = tunnel->ipc_sockets[0];
-                    pfd.events = POLLIN;
-                    if (poll(&pfd, 1, timeout) > 0) {
-                        fprintf(stderr, "Local client socket is ready to be read!\n");
-                        size_t recvbuf_max = TLS_MAX_ENCRYPTED_RECORD_SIZE;
-                        uint8_t *recvbuf = rapido_buffer_alloc(&tunnel->read_buffer, &recvbuf_max, 1500);
-                        ssize_t data_len = recv(tunnel->ipc_sockets[0], recvbuf, recvbuf_max, 0);
-                        if (data_len < 0) {
-                            // On failure, close tunnel and mark as failed.
-                            rapido_close_tunnel(session, tunnel->tunnel_id);
-                            tunnel->state = TUNNEL_STATE_FAILED;
-                        } else {
-                            // On success, copy read buffer to the send queue for the tunnel
-                            rapido_buffer_push(&tunnel->send_buffer, recvbuf, data_len);
-                            fprintf(stderr, "Added %ld bytes to the tunnel TX buffer.\n", data_len);
-                        }
-                    }
-                }
-            });
         }
+
         bool wants_to_write = false;
         rapido_array_iter(&session->connections, i, rapido_connection_t * connection, {
             fds[nfds].fd = connection->socket;
@@ -2724,6 +2795,12 @@ int rapido_run_network(rapido_session_t *session, int timeout) {
             }
         }
     } while ((no_fds < 2 || fds_change) && has_low_occupancy(session->pending_notifications) && !session->is_closed);
+
+    rapido_array_iter(&session->tunnels, i, rapido_tunnel_t *tunnel, {
+        if (tunnel->nexthop_session && tunnel->is_parent) {
+            rapido_run_network(tunnel->nexthop_session, timeout);
+        }
+    });
     return 0;
 }
 
